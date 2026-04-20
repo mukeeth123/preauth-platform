@@ -10,6 +10,38 @@ if (!API_KEY) {
 
 const ai = new GoogleGenAI({ apiKey: API_KEY! });
 
+// Models in priority order — falls back if primary is overloaded (503 / 429)
+const MODEL_PRIORITY = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"];
+
+// Retry with exponential backoff for 503 / overload errors
+async function generateWithRetry(
+  buildRequest: (model: string) => Parameters<typeof ai.models.generateContent>[0],
+  maxRetries = 3
+): Promise<Awaited<ReturnType<typeof ai.models.generateContent>>> {
+  for (const model of MODEL_PRIORITY) {
+    let attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        return await ai.models.generateContent(buildRequest(model));
+      } catch (err: any) {
+        const status = err?.status ?? err?.response?.status ?? err?.code;
+        const is503 = status === 503 || status === 429 ||
+          (typeof err?.message === "string" && err.message.includes("high demand"));
+        if (is503 && attempt < maxRetries - 1) {
+          const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+          console.warn(`Model ${model} overloaded (attempt ${attempt + 1}). Retrying in ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+          attempt++;
+        } else {
+          console.warn(`Model ${model} failed after ${attempt + 1} attempt(s). Trying next model...`);
+          break; // try next model
+        }
+      }
+    }
+  }
+  throw new Error("All Gemini models are currently unavailable. Please try again later.");
+}
+
 export interface JustificationResponse {
   new_justification: string;
   new_attachment_text: string;
@@ -45,8 +77,8 @@ export const generateAiJustification = async (unmetCriteria: string[], policyNam
   `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+    const response = await generateWithRetry((model) => ({
+      model,
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -72,7 +104,7 @@ export const generateAiJustification = async (unmetCriteria: string[], policyNam
           required: ["new_justification", "new_attachment_text", "recommended_actions"]
         }
       }
-    });
+    }));
 
     const jsonText = response.text.trim();
     const parsedResponse: JustificationResponse = JSON.parse(jsonText);
@@ -129,8 +161,8 @@ export const generateAiAssistTips = async (request: AiAssistRequest): Promise<Ai
   `;
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
+    const response = await generateWithRetry((model) => ({
+      model,
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -159,7 +191,7 @@ export const generateAiAssistTips = async (request: AiAssistRequest): Promise<Ai
           required: ["recommended_evidence", "evidence_explanation", "recommended_phrases_to_insert", "contextual_coaching"]
         }
       }
-    });
+    }));
 
     const jsonText = response.text.trim();
     const parsedResponse: AiAssistData = JSON.parse(jsonText);
